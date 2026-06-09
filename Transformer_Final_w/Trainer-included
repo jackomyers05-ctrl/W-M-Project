@@ -1,0 +1,360 @@
+# ─── Sanity Checks ───────────────────────────────────────────────────────────
+print(f"Val disruptive shots:  {sum(val_dataset.labels)}")
+print(f"Val stable shots:      {len(val_dataset) - sum(val_dataset.labels)}")
+print(f"Train disruptive shots: {sum(train_dataset.labels)}")
+print(f"Train stable shots:     {len(train_dataset) - sum(train_dataset.labels)}")
+
+# Raw probability distributions
+model.eval()
+with torch.no_grad():
+    probs_dis, probs_sta = [], []
+    for idx in range(len(val_dataset)):
+        seq, mask, label = val_dataset[idx]
+        x   = seq.unsqueeze(0).to(device)
+        pm  = (~mask.unsqueeze(0)).to(device)
+        prob = torch.sigmoid(model(x, padding_mask=pm)).item()
+        if int(label.item()) == 1:
+            probs_dis.append(round(prob, 3))
+        else:
+            probs_sta.append(round(prob, 3))
+
+print(f"\nDisruptive probs:        {probs_dis}")
+print(f"Stable probs (first 20): {probs_sta[:20]}")
+print(f"\nMean stable prob:     {np.mean(probs_sta):.4f}")
+print(f"Mean disruptive prob: {np.mean(probs_dis):.4f}")
+
+
+
+
+import pkbar
+import pandas as pd
+import numpy as np
+from sklearn.metrics import f1_score
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, random_split
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(device)
+print(torch.cuda.get_device_name(0) if device.type == 'cuda' else 'cpu')
+
+# ─── Data Loading ────────────────────────────────────────────────────────────
+
+df = pd.read_csv("data/cmod_clean_200ms.csv", sep=',', index_col=None)
+df = df.drop(columns=["Unnamed: 0"])
+df.replace([np.inf, -np.inf], np.nan, inplace=True)
+df_cleaned = df.dropna(axis=1)
+df_cleaned = df_cleaned.sort_values(['shot', 'time']).reset_index(drop=True)
+print(df_cleaned.columns)
+
+# ─── Normalize features (per-column z-score) ─────────────────────────────────
+# Do this BEFORE building the dataset so padding zeros are meaningful (≈ mean)
+feature_cols = [c for c in df_cleaned.columns if c not in ('shot', 'disruptive', 'time')]
+means = df_cleaned[feature_cols].mean()
+stds  = df_cleaned[feature_cols].std().replace(0, 1)   # avoid /0
+df_cleaned[feature_cols] = (df_cleaned[feature_cols] - means) / stds
+
+# ─── Dataset ─────────────────────────────────────────────────────────────────
+
+class CustomDataset(torch.utils.data.Dataset):
+    def __init__(self, df):
+        self.sequences = []
+        self.labels    = []
+        self.max_length = 0
+
+        feat_cols = [c for c in df.columns if c not in ('shot', 'disruptive', 'time')]
+
+        for _, group in df.groupby('shot'):
+            label = group['disruptive'].iloc[0]
+            self.labels.append(label)
+
+            idx_         = np.argsort(group['time'].values)
+            group_sorted = group.iloc[idx_]
+            features     = group_sorted[feat_cols].values.astype(np.float32)
+            self.sequences.append(features)
+
+            if features.shape[0] > self.max_length:
+                self.max_length = features.shape[0]
+
+        print("Max seq len:", self.max_length)
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        seq   = self.sequences[idx]          # (T, F)
+        label = self.labels[idx]
+
+        # Zero-pad to max_length (safe after z-score norm — zeros ≈ mean)
+        padded = np.zeros((self.max_length, seq.shape[1]), dtype=np.float32)
+        padded[:len(seq)] = seq
+
+        # True = real data, False = pad  (flipped to True=IGNORE inside train loop)
+        pad_mask = np.zeros(self.max_length, dtype=np.bool_)
+        pad_mask[:len(seq)] = True
+
+        return (torch.tensor(padded,    dtype=torch.float32),
+                torch.tensor(pad_mask,  dtype=torch.bool),
+                torch.tensor(float(label), dtype=torch.float32))
+
+
+
+num_features = full_dataset.sequences[0].shape[1]
+max_seq_len  = full_dataset.max_length
+
+print(f"Label stats — Unique: {set(full_dataset.labels)}")
+print(f"Num features: {num_features}, Max seq len: {max_seq_len}")
+print(f"Total sequences: {len(full_dataset)}\n")
+
+# ─── Chronological Split + Normalize ─────────────────────────────────────────
+feature_cols = [c for c in df_cleaned.columns if c not in ('shot', 'disruptive', 'time')]
+
+all_shots = sorted(df_cleaned['shot'].unique())
+n_train   = int(0.8 * len(all_shots))
+train_shots = set(all_shots[:n_train])
+val_shots   = set(all_shots[n_train:])
+
+train_df = df_cleaned[df_cleaned['shot'].isin(train_shots)].reset_index(drop=True)
+val_df   = df_cleaned[df_cleaned['shot'].isin(val_shots)].reset_index(drop=True)
+
+# Normalize using train stats only
+means = train_df[feature_cols].mean()
+stds  = train_df[feature_cols].std().replace(0, 1)
+train_df[feature_cols] = (train_df[feature_cols] - means) / stds
+val_df[feature_cols]   = (val_df[feature_cols]   - means) / stds
+
+train_dataset = CustomDataset(train_df)
+val_dataset   = CustomDataset(val_df)
+
+num_features = train_dataset.sequences[0].shape[1]
+max_seq_len  = train_dataset.max_length  # pad based on train only
+
+train_dl = DataLoader(train_dataset, batch_size=64, shuffle=True,  num_workers=0, pin_memory=True)
+valid_dl = DataLoader(val_dataset,   batch_size=64, shuffle=False, num_workers=0, pin_memory=True)
+
+print(f"Training size:   {len(train_dataset)}")
+print(f"Validation size: {len(val_dataset)}")
+
+# ─── FF Block ────────────────────────────────────────────────────────────────
+
+class FF(nn.Module):
+    def __init__(self, embed_dim, mlp_scale: int = 2, drop_rate: float = 0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * mlp_scale),
+            nn.GELU(),
+            nn.Linear(embed_dim * mlp_scale, embed_dim),
+            nn.Dropout(drop_rate),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+# ─── MHSA ────────────────────────────────────────────────────────────────────
+
+class MHSA(nn.Module):
+    def __init__(self, embed_dim, num_heads, dropout=0.0, device='cuda'):
+        super().__init__()
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+
+        self.num_heads = num_heads
+        self.head_dim  = embed_dim // num_heads
+        self.scale     = self.head_dim ** 0.5
+
+        self.k_proj  = nn.Linear(embed_dim, embed_dim)
+        self.q_proj  = nn.Linear(embed_dim, embed_dim)
+        self.v_proj  = nn.Linear(embed_dim, embed_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, key_padding_mask=None, need_weights=False):
+        B, T, C = x.shape
+
+        q = self.q_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+
+        attn = (q @ k.transpose(-2, -1)) / self.scale          # (B, H, T, T)
+
+        if key_padding_mask is not None:
+            # key_padding_mask: (B, T), True = IGNORE
+            attn = attn.masked_fill(key_padding_mask[:, None, None, :], -1e9)
+            # Use -1e9 instead of -inf to avoid NaN when entire rows are masked
+
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+
+        out = (attn @ v).transpose(1, 2).contiguous().view(B, T, C)
+        return out, (attn if need_weights else None)
+
+# ─── EncoderBlock ─────────────────────────────────────────────────────────────
+
+class EncoderBlock(nn.Module):
+    def __init__(self, embed_dim, num_heads, mlp_scale: int = 2,
+                 drop_rate: float = 0.0, device='cuda'):
+        super().__init__()
+        self.LN1    = nn.LayerNorm(embed_dim)
+        self.attn   = MHSA(embed_dim, num_heads, dropout=drop_rate, device=device)
+        self.c_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.LN2    = nn.LayerNorm(embed_dim)
+        self.ff     = FF(embed_dim, mlp_scale=mlp_scale, drop_rate=drop_rate)
+
+    def forward(self, x, padding_mask=None, need_weights=False):
+        attn_out, attn_weights = self.attn(
+            self.LN1(x), key_padding_mask=padding_mask, need_weights=need_weights
+        )
+        x = x + self.c_proj(attn_out)
+        x = x + self.ff(self.LN2(x))
+        return x
+
+# ─── Classifier ──────────────────────────────────────────────────────────────
+
+class Classifier(nn.Module):
+    def __init__(self, num_features, embed_dim, num_classes=1,
+                 attn_heads=[4, 8, 8], mlp_scale: int = 2,
+                 drop_rates=[0.0, 0.0, 0.0], device='cuda', max_seq_len=182):
+        super().__init__()
+        assert len(drop_rates) == len(attn_heads)
+
+        self.embedding     = nn.Linear(num_features, embed_dim)
+        self.cls_token     = nn.Parameter(torch.randn(1, 1, embed_dim))
+        self.pos_embedding = nn.Parameter(torch.randn(1, max_seq_len + 1, embed_dim))
+
+        self.layers = nn.ModuleList([
+            EncoderBlock(embed_dim, attn_heads[i], mlp_scale,
+                         drop_rate=drop_rates[i], device=device)
+            for i in range(len(attn_heads))
+        ])
+
+        self.mlp_head = nn.Linear(embed_dim, num_classes)
+
+    def forward(self, x, padding_mask=None):
+        B = x.size(0)
+
+        x = self.embedding(x)                                       # (B, T, D)
+        x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)  # (B, T+1, D)
+        x = x + self.pos_embedding[:, :x.size(1)]
+
+        if padding_mask is not None:
+            cls_mask     = torch.zeros(B, 1, dtype=torch.bool, device=x.device)
+            padding_mask = torch.cat([cls_mask, padding_mask], dim=1)
+
+        for layer in self.layers:
+            x = layer(x, padding_mask=padding_mask)
+
+        return self.mlp_head(x[:, 0]).squeeze(-1)                   # (B,)
+
+# ─── Model Init ──────────────────────────────────────────────────────────────
+
+embed_dim   = 256
+mlp_scale   = 2
+drop_rates  = [0.1, 0.1, 0.1]
+attn_heads  = [4, 8, 8]
+num_classes = 1
+
+model = Classifier(
+    num_features=num_features,
+    embed_dim=embed_dim,
+    num_classes=num_classes,
+    attn_heads=attn_heads,
+    mlp_scale=mlp_scale,
+    drop_rates=drop_rates,
+    device=device,
+    max_seq_len=max_seq_len,
+)
+model.to(device)
+print(f"Network Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+# ─── Training ────────────────────────────────────────────────────────────────
+
+def train(model, num_epochs, train_dl, valid_dl, lr=1e-4, device='cuda', seed=8):
+    model.to(device)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    # Class-weighted loss for imbalanced disruption data
+    all_labels  = torch.tensor([y for _, _, y in train_dl.dataset])
+    pos         = all_labels.sum().item()
+    neg         = len(all_labels) - pos
+    pos_weight  = torch.tensor([neg / pos], device=device)
+    print(f"Class balance — pos: {int(pos)}, neg: {int(neg)}, pos_weight: {pos_weight.item():.2f}")
+
+    loss_fn   = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    loss_hist_train,     loss_hist_valid     = [0] * num_epochs, [0] * num_epochs
+    accuracy_hist_train, accuracy_hist_valid = [0] * num_epochs, [0] * num_epochs
+    f1_hist_train,       f1_hist_valid       = [0] * num_epochs, [0] * num_epochs
+
+    for epoch in range(num_epochs):
+        model.train()
+        kbar = pkbar.Kbar(target=len(train_dl), epoch=epoch, num_epochs=num_epochs,
+                          width=20, always_stateful=False)
+
+        total_loss    = 0
+        all_preds_tr  = []
+        all_labels_tr = []
+
+        for i, (x_batch, pad_mask, y_batch) in enumerate(train_dl):
+            x_batch  = x_batch.to(device)
+            y_batch  = y_batch.to(device)
+            # Flip: dataset True=real → model expects True=IGNORE
+            padding_mask = (~pad_mask).to(device)
+
+            pred = model(x_batch, padding_mask=padding_mask)
+            loss = loss_fn(pred, y_batch)
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            preds_bin  = (pred > 0).float()
+            batch_acc  = (preds_bin == y_batch).float().mean().item()
+            total_loss += loss.item() * y_batch.size(0)
+
+            all_preds_tr.extend(preds_bin.cpu().tolist())
+            all_labels_tr.extend(y_batch.cpu().tolist())
+
+            kbar.update(i, values=[("loss", loss.item()), ("acc", batch_acc)])
+
+        loss_hist_train[epoch]     = total_loss / len(train_dl.dataset)
+        accuracy_hist_train[epoch] = (np.array(all_preds_tr) == np.array(all_labels_tr)).mean()
+        f1_hist_train[epoch]       = f1_score(all_labels_tr, all_preds_tr, zero_division=0)
+
+        # ── Validation ───────────────────────────────────────────────────────
+        model.eval()
+        val_loss       = 0
+        all_preds_val  = []
+        all_labels_val = []
+
+        with torch.no_grad():
+            for x_batch, pad_mask, y_batch in valid_dl:
+                x_batch      = x_batch.to(device)
+                y_batch      = y_batch.to(device)
+                padding_mask = (~pad_mask).to(device)
+
+                pred     = model(x_batch, padding_mask=padding_mask)
+                val_loss += loss_fn(pred, y_batch).item() * y_batch.size(0)
+
+                preds_bin = (pred > 0).float()
+                all_preds_val.extend(preds_bin.cpu().tolist())
+                all_labels_val.extend(y_batch.cpu().tolist())
+
+        loss_hist_valid[epoch]     = val_loss / len(valid_dl.dataset)
+        accuracy_hist_valid[epoch] = (np.array(all_preds_val) == np.array(all_labels_val)).mean()
+        f1_hist_valid[epoch]       = f1_score(all_labels_val, all_preds_val, zero_division=0)
+
+        print(
+            f"Epoch {epoch+1:02d} | "
+            f"Train  Loss: {loss_hist_train[epoch]:.4f}  Acc: {accuracy_hist_train[epoch]:.4f}  F1: {f1_hist_train[epoch]:.4f} | "
+            f"Val    Loss: {loss_hist_valid[epoch]:.4f}  Acc: {accuracy_hist_valid[epoch]:.4f}  F1: {f1_hist_valid[epoch]:.4f}"
+        )
+
+    return loss_hist_train, loss_hist_valid, accuracy_hist_train, accuracy_hist_valid, f1_hist_train, f1_hist_valid
+
+# ─── Run ─────────────────────────────────────────────────────────────────────
+
+num_epochs = 10
+hist = train(model, num_epochs, train_dl, valid_dl)
