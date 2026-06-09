@@ -1,0 +1,46 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+
+# Load data
+df = pd.read_csv("data/cmod_clean_200ms.csv", sep=',', index_col=None)
+
+# Extract features (16 values) and target (disruption label)
+features = df.iloc[:, :-1].values  # All columns except last
+target = df.iloc[:, -1].values     # Last column is disruption label (0 or 1)
+
+# Normalize features
+scaler = StandardScaler()
+features = scaler.fit_transform(features)
+
+# Create sequences (sliding windows for LSTM)
+def create_sequences(data, labels, seq_len=50):
+    X, y = [], []
+    for i in range(len(data) - seq_len):
+        X.append(data[i:i+seq_len])
+        y.append(labels[i+seq_len])
+    return np.array(X), np.array(y)
+
+x_np, y_np = create_sequences(features, target, seq_len=50)
+
+# Dataset class
+class LSTMDataset(Dataset):
+    def __init__(self, x_data, y_data):
+        self.x = torch.tensor(x_data, dtype=torch.float32)
+        self.y = torch.tensor(y_data, dtype=torch.long)
+
+    def __getitem__(self, idx):
+        return self.x[idx], self.y[idx]
+
+    def __len__(self):
+        return len(self.x)
+
+# Create dataloader
+dataset = LSTMDataset(x_np, y_np)
+train_loader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+# MODEL
