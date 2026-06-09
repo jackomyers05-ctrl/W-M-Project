@@ -53,7 +53,7 @@ val_dataset = target[train_size: (train_size+val_size)]
 test_dataset = target[(train_size + val_size): (total_size)]
 
 # Dataset class
-class LSTMDataset(Dataset):
+class TransformerDataset(Dataset):
     def __init__(self, x_data, y_data):
         self.x = torch.tensor(x_data, dtype=torch.float32)
         self.y = torch.tensor(y_data, dtype=torch.long)
@@ -112,73 +112,43 @@ class MHSA(nn.Module):
         k = self.k_proj(x)
         v = self.v_proj(x)
 
-        # We want multi-head attention - typically this is done through reshaping our output
-        # This is implicit concatenation - equivalent
-        # We will use the tensor.view() operation
-        # Hint: We want our Q,K,V matrices to be shaped like (batch,seq_len,num_heads,head_dim)
+        # Shaping Q, K, and V tensors
         k = tensor.view(batch_size, seq_len, self.num_heads, self.head_dim)
         v = tensor.view(batch_size, seq_len, self.num_heads, self.head_dim)
         q = tensor.view(batch_size, seq_len, self.num_heads, self.head_dim)
 
-        # Transpose to align axis for computation of attention scores per head
-        # (batch,seq_len,num_heads,head_dim) -> (batch,num_heads,seq_len,head_dim)
-        # Hint: We want to use a transpose over dimensions (1,2) for all three
+        # Transposing for alignment, don't change
         k = torch.transpose(k, 1, 2)
         q = torch.transpose(q, 1, 2)
         v = torch.transpose(v, 1, 2)
 
-        # Compute the attention scores with matrix operations - this is the argument of the softmax QK^T / sqrt(d_k)
-        # again we need to be careful with the dimensions of K after we transpose
-        # K is of shape (batch, num_heads, seq_len, head_dim)
-        # Q is of shape (batch, num_heads, seq_len, head_dim)
-        # To compute Q @ K^T, we need to transpose the last two dimensions of K so that:
-        # K.transpose(2, 3) gives shape (batch, num_heads, head_dim, seq_len)
-        # Resulting attn_scores shape: (batch, num_heads, seq_len, seq_len)
-        # Each attention head now contains a full pairwise similarity matrix between all tokens
-        # We also need to divide by self.d_k for normalization constant!
+        # Attention determination, don't change
         K = torch.transpose(k, 2, 3)
         Q = q
         attn_scores = Q @ K^T / self.d_k
 
-        # This will always be None for our models
-        # I am strategically leaving it here for you in case you want to use Masked MHSA
+        # Option for masked
         if attn_mask is not None:
             attn_scores.masked_fill_(attn_mask,-torch.inf)
 
-        # This will also always be None for our models
-        # I am strategically leaving it here for you in case you do something with padded inputs (i.e. [SOS,token1,token2, ..., tokenN,EOS,pad,pad,pad,pad])
+        # Option for adding padding
         if key_padding_mask is not None:
             key_padding_mask = key_padding_mask[:, None, None, :]
             attn_scores.masked_fill_(key_padding_mask,-torch.inf)
 
-        # Compute the softmax over our attention scores. This should be over the last dimension - dim=-1
-        # Use nn.functional to do this - we imported it as F
+        # Compute the softmax over attention
         attn_scores = F.softmax(attn_scores, dim=-1)
 
         # Apply dropout
         attn_scores = self.dropout(attn_scores)
 
-        # Now we have our attention weights in the form softmax(QK^T / sqrt(d_k))
-        # Your next task is to apply these attention weights to the Value matrix V.
-        # This means performing a batched matrix multiplication between attn_scores and v.
-        # Hint: This is softmax(QK^T / sqrt(d_k)) @ V
-        # attn_scores shape: (batch, num_heads, seq_len, seq_len)
-        # v shape:           (batch, num_heads, seq_len, head_dim)
-        # The result should be of shape: (batch, num_heads, seq_len, head_dim)
-        # Fill in this line with the correct matrix multiplication
+        # Apply V weighting
         attn_output = attn_scores @ v
 
-        # Now you need to rearrange the output so that the num_heads dimension is moved after the seq_len.
-        # attn_output is currently shaped: (batch, num_heads, seq_len, head_dim)
-        # You want to transpose it to: (batch, seq_len, num_heads, head_dim)
-        # This will prepare it to be reshaped into the original embedding dimension.
-        # Hint: We want to use a transpose over dimensions (1,2)
-        # Fill in this line with the correct matrix multiplication
+        # Transpose for alignment, don't change
         attn_output = torch.transpose(attn_output, 1, 2)
 
-        # Finally, flatten the last two dimensions (num_heads and head_dim) back into a single embedding dimension.
-        # The final output should be of shape: (batch, seq_len, embed_dim), where embed_dim = num_heads * head_dim
-        # I'll give you this one as we need a contiguous call
+        # Flatten back out to 1 dimension
         attn_output = attn_output.contiguous().view(batch_size,seq_len,embed_dim)
 
         if need_weights:
@@ -195,56 +165,31 @@ class EncoderBlock(nn.Module):
         self.device = device
         self.mlp_scale = mlp_scale
         self.drop_rate = drop_rate
-        # We need our first layernorm
-        # Hint: nn.LayerNorm() - this will expect tensors with dim=embed_dim
         self.LN1 = nn.LayerNorm(embed_dim)
-        # Each EncoderBlock will need the attention mechanism we created above
-        # it expects (embed_dim=, num_heads=, seq_len=, dropout=,device=)
-        # Hint: Look at what we have stored in self. above!
         self.attn = MHSA(embed_dim=embed_dim, num_heads=num_heads, seq_len=250, dropout=drop_rate, device=device)
-        # We are going to use an (optional linear projection after the attention - I will do this for you)
         self.c_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-        # We need our second layernorm - same as above
         self.LN2 = nn.LayerNorm(embed_dim)
-        # We need our feed forward network that we created above
-        # it expects (embed_dim= , mlp_scale=, drop_rate=)
-        # Hint: Look at what we have stored in self. above!
+        # Feed forward
         self.FF = FF(embed_dim=embed_dim, mlp_scale=mlp_scale, drop_rate=drop_rate)
 
-
-    # We will not use this function
-    # This dnymically creates the mask for masked attention
-    # There are other (perhaps better) ways to do it through a registering a buffer
-    # Leaving it here for you as well
+    # Mask generation, unused
     def generate_mask(self,seq_len):
         return torch.triu(torch.ones((seq_len, seq_len), device=self.device, dtype=torch.bool), diagonal=1)
 
     def forward(self, x,padding_mask=None,need_weights=False):
         B,N_t,t_dim = x.shape
-        # We are going to deploy a pre norm strategy
-        # You need to use your first layernorm self.LN1 here to produce x_norm
         x_norm = self.Ln1(x)
-
-        # We pass this to our attention block
-        # the output of our this block should be attn,attn_weights
-        # Recall that I have left some optional arguments from before, specifcally key_padding_mask and need_weights
-        # Set both of these to False explicicty
+        
+        # Calculate attention and weights
         attn,attn_weights = self.attn(x_norm, key_padding_mask=None, need_weights=False)
 
         attn = self.c_proj(attn) # Optional projection layer - done for you
 
-        # Now we need to operform the addition and residual connections
-        # Lets first do the addition
-        # We want to add our attn output to x
-        # Hint: x = x + ____
+        # Add attention
         x = x + attn
-        # Now lets do the residual connection - we are going to do this in parts
-        # First lets calculate the residual part coming from the FF network.
-        # We also want to apply our post norm (LN2) to the input to this network
-        # Something like FF(LN2(x))
+        # Calculate residual to add
         res = self.FF(self.LN2(x))
-        # Now add the residual part back to x
-        # Hint: x = x + ___
+        # Add residual
         x = x + res
         return x
 
@@ -422,4 +367,5 @@ def plot_loss(hist):
     plt.show()
 
 plot_loss(hist)
+
 
