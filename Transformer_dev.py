@@ -516,3 +516,121 @@ show_samples("False Negatives (missed disruptions)",   fn_list)
 
 print(f"\nSummary: {len(tp_list)} TP | {len(fp_list)} FP | {len(tn_list)} TN | {len(fn_list)} FN")
 print(f"Missed disruptions: {len(fn_list)} / {len(tp_list)+len(fn_list)} total disruptive shots")
+
+# ─── 8. Random Walk Robustness Test ──────────────────────────────────────────
+# Evaluates the trained model on randomly shuffled subsets of the full dataset.
+# Each iteration uses a unique random seed to resample the test split at the
+# shot level, testing whether high training accuracy generalises across samples.
+
+NUM_RW_ITERATIONS = 100   # configurable — number of random seeds to test
+RW_TEST_FRACTION  = 0.20  # fraction of shots drawn as the test set each iteration
+
+# Reload the full dataset with the same cleaning pipeline used during training
+rw_df = pd.read_csv("data/cmod_clean_200ms.csv", sep=',', index_col=None)
+rw_df = rw_df.drop(columns=["Unnamed: 0"])
+rw_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+rw_df = rw_df.dropna(axis=1)
+rw_df = rw_df.sort_values(['shot', 'time']).reset_index(drop=True)
+
+rw_feature_cols = [c for c in rw_df.columns if c not in ('shot', 'disruptive', 'time')]
+
+# Normalise using the same training statistics so the model sees familiar inputs
+rw_df[rw_feature_cols] = (rw_df[rw_feature_cols] - means) / stds
+
+all_shot_ids = list(rw_df['shot'].unique())
+
+# Draw NUM_RW_ITERATIONS unique random seeds without replacement
+rw_seed_list = random.sample(range(1, 100_001), NUM_RW_ITERATIONS)
+
+rw_accuracies = []
+rw_f1s        = []
+
+print(f"\n{'='*55}")
+print(f"  RANDOM WALK ROBUSTNESS TEST  ({NUM_RW_ITERATIONS} iterations)")
+print(f"{'='*55}")
+
+for i, seed in enumerate(rw_seed_list):
+    # Shuffle shot IDs with this seed, then take the first RW_TEST_FRACTION
+    rng = random.Random(seed)
+    shuffled = all_shot_ids.copy()
+    rng.shuffle(shuffled)
+
+    n_test     = max(1, int(RW_TEST_FRACTION * len(shuffled)))
+    test_shots = set(shuffled[:n_test])
+    test_df    = rw_df[rw_df['shot'].isin(test_shots)].reset_index(drop=True)
+
+    # Silence the max-seq-len print inside CustomDataset for cleaner output
+    import io, contextlib
+    with contextlib.redirect_stdout(io.StringIO()):
+        rw_test_dataset = CustomDataset(test_df)
+
+    rw_test_dl = DataLoader(rw_test_dataset, batch_size=64, shuffle=False,
+                            num_workers=0, pin_memory=True)
+
+    model.eval()
+    iter_preds  = []
+    iter_labels = []
+
+    with torch.no_grad():
+        for x_batch, pad_mask, y_batch in rw_test_dl:
+            x_batch      = x_batch.to(device)
+            padding_mask = (~pad_mask).to(device)
+
+            logits    = model(x_batch, padding_mask=padding_mask)
+            preds_bin = (logits > 0).float()
+
+            iter_preds.extend(preds_bin.cpu().tolist())
+            iter_labels.extend(y_batch.tolist())
+
+    acc = (np.array(iter_preds) == np.array(iter_labels)).mean()
+    f1  = f1_score(iter_labels, iter_preds, zero_division=0)
+    rw_accuracies.append(acc)
+    rw_f1s.append(f1)
+
+    print(f"  Iter {i+1:3d}/{NUM_RW_ITERATIONS}  seed={seed:6d}  n_shots={n_test:4d}"
+          f"  acc={acc:.4f}  f1={f1:.4f}")
+
+# ─── Plot Random Walk Results ─────────────────────────────────────────────────
+
+rw_iters   = range(1, NUM_RW_ITERATIONS + 1)
+mean_acc   = np.mean(rw_accuracies)
+std_acc    = np.std(rw_accuracies)
+mean_f1    = np.mean(rw_f1s)
+std_f1     = np.std(rw_f1s)
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+fig.suptitle(
+    f"Random Walk Robustness Test — {NUM_RW_ITERATIONS} Shuffled Samples "
+    f"({int(RW_TEST_FRACTION*100)}% of shots each)",
+    fontsize=13, fontweight='bold'
+)
+
+axes[0].plot(rw_iters, rw_accuracies, color='#2563eb', lw=1.2, alpha=0.8, label='Accuracy')
+axes[0].axhline(mean_acc, color='#f97316', linestyle='--', lw=2,
+                label=f'Mean = {mean_acc:.4f}')
+axes[0].fill_between(rw_iters,
+                     mean_acc - std_acc, mean_acc + std_acc,
+                     color='#2563eb', alpha=0.15, label=f'±1σ = {std_acc:.4f}')
+axes[0].set_title('Accuracy per Iteration')
+axes[0].set_xlabel('Iteration'); axes[0].set_ylabel('Accuracy')
+axes[0].set_ylim(0, 1); axes[0].legend(); axes[0].grid(alpha=0.3)
+
+axes[1].plot(rw_iters, rw_f1s, color='#16a34a', lw=1.2, alpha=0.8, label='F1')
+axes[1].axhline(mean_f1, color='#f97316', linestyle='--', lw=2,
+                label=f'Mean = {mean_f1:.4f}')
+axes[1].fill_between(rw_iters,
+                     mean_f1 - std_f1, mean_f1 + std_f1,
+                     color='#16a34a', alpha=0.15, label=f'±1σ = {std_f1:.4f}')
+axes[1].set_title('F1 Score per Iteration')
+axes[1].set_xlabel('Iteration'); axes[1].set_ylabel('F1 Score')
+axes[1].set_ylim(0, 1); axes[1].legend(); axes[1].grid(alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('random_walk_results.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+print(f"\nRandom Walk Summary ({NUM_RW_ITERATIONS} iterations, {int(RW_TEST_FRACTION*100)}% test split):")
+print(f"  Accuracy  —  mean: {mean_acc:.4f}  std: {std_acc:.4f}"
+      f"  min: {min(rw_accuracies):.4f}  max: {max(rw_accuracies):.4f}")
+print(f"  F1 Score  —  mean: {mean_f1:.4f}  std: {std_f1:.4f}"
+      f"  min: {min(rw_f1s):.4f}  max: {max(rw_f1s):.4f}")
