@@ -33,24 +33,24 @@ scaler = StandardScaler()
 features = scaler.fit_transform(features) # failing due to inf values
 
 # 70/15/15 split, features
-total_size = int(len(dataset))
+total_size = int(len(df))
 train_size = int(0.7 * total_size)
 val_size = int(0.15 * total_size)
 test_size = int(0.15 * total_size)
 # Selection idx order is train->val->test
-train_dataset = features[0:train_size]
-val_dataset = features[train_size: (train_size+val_size)]
-test_dataset = features[(train_size + val_size): (total_size)]
+train_dataset_feature = features[0:train_size]
+val_dataset_feature = features[train_size: (train_size+val_size)]
+test_dataset_feature = features[(train_size + val_size): (total_size)]
 
 # 70/15/15 split, target
-total_size = int(len(dataset))
+total_size = int(len(df))
 train_size = int(0.7 * total_size)
 val_size = int(0.15 * total_size)
 test_size = int(0.15 * total_size)
 # Selection idx order is train->val->test
-train_dataset = target[0:train_size]
-val_dataset = target[train_size: (train_size+val_size)]
-test_dataset = target[(train_size + val_size): (total_size)]
+train_dataset_target = target[0:train_size]
+val_dataset_target = target[train_size: (train_size+val_size)]
+test_dataset_target = target[(train_size + val_size): (total_size)]
 
 # Dataset class
 class TransformerDataset(Dataset):
@@ -65,7 +65,7 @@ class TransformerDataset(Dataset):
         return len(self.x)
 
 # Create dataloader
-dataset = TransformerDataset(x_np, y_np)
+dataset = TransformerDataset(train_dataset_feature, train_dataset_target)
 # can also be "dataset = LSTMDataset(features, target)
 train_loader = DataLoader(dataset, batch_size=32, shuffle=True)
 
