@@ -1,31 +1,3 @@
-# ─── Sanity Checks ───────────────────────────────────────────────────────────
-print(f"Val disruptive shots:  {sum(val_dataset.labels)}")
-print(f"Val stable shots:      {len(val_dataset) - sum(val_dataset.labels)}")
-print(f"Train disruptive shots: {sum(train_dataset.labels)}")
-print(f"Train stable shots:     {len(train_dataset) - sum(train_dataset.labels)}")
-
-# Raw probability distributions
-model.eval()
-with torch.no_grad():
-    probs_dis, probs_sta = [], []
-    for idx in range(len(val_dataset)):
-        seq, mask, label = val_dataset[idx]
-        x   = seq.unsqueeze(0).to(device)
-        pm  = (~mask.unsqueeze(0)).to(device)
-        prob = torch.sigmoid(model(x, padding_mask=pm)).item()
-        if int(label.item()) == 1:
-            probs_dis.append(round(prob, 3))
-        else:
-            probs_sta.append(round(prob, 3))
-
-print(f"\nDisruptive probs:        {probs_dis}")
-print(f"Stable probs (first 20): {probs_sta[:20]}")
-print(f"\nMean stable prob:     {np.mean(probs_sta):.4f}")
-print(f"Mean disruptive prob: {np.mean(probs_dis):.4f}")
-
-
-
-
 import pkbar
 import pandas as pd
 import numpy as np
@@ -97,15 +69,6 @@ class CustomDataset(torch.utils.data.Dataset):
         return (torch.tensor(padded,    dtype=torch.float32),
                 torch.tensor(pad_mask,  dtype=torch.bool),
                 torch.tensor(float(label), dtype=torch.float32))
-
-
-
-num_features = full_dataset.sequences[0].shape[1]
-max_seq_len  = full_dataset.max_length
-
-print(f"Label stats — Unique: {set(full_dataset.labels)}")
-print(f"Num features: {num_features}, Max seq len: {max_seq_len}")
-print(f"Total sequences: {len(full_dataset)}\n")
 
 # ─── Chronological Split + Normalize ─────────────────────────────────────────
 feature_cols = [c for c in df_cleaned.columns if c not in ('shot', 'disruptive', 'time')]
