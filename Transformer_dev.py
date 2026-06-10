@@ -1,371 +1,518 @@
-### Imports
+import pkbar
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+from sklearn.metrics import f1_score
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import StandardScaler
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, random_split
 
-# Set random seed for reproducibility 
-torch.manual_seed(1) 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(device)
+print(torch.cuda.get_device_name(0) if device.type == 'cuda' else 'cpu')
 
-# Load data
+# ─── Data Loading ────────────────────────────────────────────────────────────
+
 df = pd.read_csv("data/cmod_clean_200ms.csv", sep=',', index_col=None)
+df = df.drop(columns=["Unnamed: 0"])
+df.replace([np.inf, -np.inf], np.nan, inplace=True)
+df_cleaned = df.dropna(axis=1)
+df_cleaned = df_cleaned.sort_values(['shot', 'time']).reset_index(drop=True)
+print(df_cleaned.columns)
 
-# Remove all data with NaN or inf values. 
-# pseudocode, idk bro
+# ─── Normalize features (per-column z-score) ─────────────────────────────────
+# Do this BEFORE building the dataset so padding zeros are meaningful (≈ mean)
+feature_cols = [c for c in df_cleaned.columns if c not in ('shot', 'disruptive', 'time')]
+means = df_cleaned[feature_cols].mean()
+stds  = df_cleaned[feature_cols].std().replace(0, 1)   # avoid /0
+df_cleaned[feature_cols] = (df_cleaned[feature_cols] - means) / stds
 
-# View data size and observe data visually, ground-truth
-print(df.shape)
-df.hist(figsize=(15,15),bins=50,density=True)
+# ─── Dataset ─────────────────────────────────────────────────────────────────
 
-# Extract features (64 raw values) and target (disruption label)
-features = df.iloc[:, :-1].values  # All columns except last, returns as a numpy array. 
-target = df.iloc[:, -1].values     # Last column is disruption label (0 or 1)
-print(features.shape) 
-print(target.shape)
+class CustomDataset(torch.utils.data.Dataset):
+    def __init__(self, df):
+        self.sequences = []
+        self.labels    = []
+        self.max_length = 0
 
-#features.hist(figsize=(15,15),bins=50,density=True) # check data in the dataset
+        feat_cols = [c for c in df.columns if c not in ('shot', 'disruptive', 'time')]
 
-# Normalize features
-scaler = StandardScaler()
-features = scaler.fit_transform(features) # failing due to inf values
+        for _, group in df.groupby('shot'):
+            label = group['disruptive'].iloc[0]
+            self.labels.append(label)
 
-# 70/15/15 split, features
-total_size = int(len(df))
-train_size = int(0.7 * total_size)
-val_size = int(0.15 * total_size)
-test_size = int(0.15 * total_size)
-# Selection idx order is train->val->test
-train_dataset_feature = features[0:train_size]
-val_dataset_feature = features[train_size: (train_size+val_size)]
-test_dataset_feature = features[(train_size + val_size): (total_size)]
+            idx_         = np.argsort(group['time'].values)
+            group_sorted = group.iloc[idx_]
+            features     = group_sorted[feat_cols].values.astype(np.float32)
+            self.sequences.append(features)
 
-# 70/15/15 split, target
-total_size = int(len(df))
-train_size = int(0.7 * total_size)
-val_size = int(0.15 * total_size)
-test_size = int(0.15 * total_size)
-# Selection idx order is train->val->test
-train_dataset_target = target[0:train_size]
-val_dataset_target = target[train_size: (train_size+val_size)]
-test_dataset_target = target[(train_size + val_size): (total_size)]
+            if features.shape[0] > self.max_length:
+                self.max_length = features.shape[0]
 
-# Dataset class
-class TransformerDataset(Dataset):
-    def __init__(self, x_data, y_data):
-        self.x = torch.tensor(x_data, dtype=torch.float32)
-        self.y = torch.tensor(y_data, dtype=torch.long)
-
-    def __getitem__(self, idx):
-        return self.x[idx], self.y[idx]
+        print("Max seq len:", self.max_length)
 
     def __len__(self):
-        return len(self.x)
+        return len(self.sequences)
 
-# Create dataloader
-dataset = TransformerDataset(train_dataset_feature, train_dataset_target)
-# can also be "dataset = LSTMDataset(features, target)
-train_loader = DataLoader(dataset, batch_size=32, shuffle=True)
+    def __getitem__(self, idx):
+        seq   = self.sequences[idx]          # (T, F)
+        label = self.labels[idx]
 
-# Model components
+        # Zero-pad to max_length (safe after z-score norm — zeros ≈ mean)
+        padded = np.zeros((self.max_length, seq.shape[1]), dtype=np.float32)
+        padded[:len(seq)] = seq
+
+        # True = real data, False = pad  (flipped to True=IGNORE inside train loop)
+        pad_mask = np.zeros(self.max_length, dtype=np.bool_)
+        pad_mask[:len(seq)] = True
+
+        return (torch.tensor(padded,    dtype=torch.float32),
+                torch.tensor(pad_mask,  dtype=torch.bool),
+                torch.tensor(float(label), dtype=torch.float32))
+
+# ─── Chronological Split + Normalize ─────────────────────────────────────────
+feature_cols = [c for c in df_cleaned.columns if c not in ('shot', 'disruptive', 'time')]
+
+all_shots = sorted(df_cleaned['shot'].unique())
+n_train   = int(0.8 * len(all_shots))
+train_shots = set(all_shots[:n_train])
+val_shots   = set(all_shots[n_train:])
+
+train_df = df_cleaned[df_cleaned['shot'].isin(train_shots)].reset_index(drop=True)
+val_df   = df_cleaned[df_cleaned['shot'].isin(val_shots)].reset_index(drop=True)
+
+# Normalize using train stats only
+means = train_df[feature_cols].mean()
+stds  = train_df[feature_cols].std().replace(0, 1)
+train_df[feature_cols] = (train_df[feature_cols] - means) / stds
+val_df[feature_cols]   = (val_df[feature_cols]   - means) / stds
+
+train_dataset = CustomDataset(train_df)
+val_dataset   = CustomDataset(val_df)
+
+num_features = train_dataset.sequences[0].shape[1]
+max_seq_len  = train_dataset.max_length  # pad based on train only
+
+train_dl = DataLoader(train_dataset, batch_size=64, shuffle=True,  num_workers=0, pin_memory=True)
+valid_dl = DataLoader(val_dataset,   batch_size=64, shuffle=False, num_workers=0, pin_memory=True)
+
+print(f"Training size:   {len(train_dataset)}")
+print(f"Validation size: {len(val_dataset)}")
+
+# ─── FF Block ────────────────────────────────────────────────────────────────
 
 class FF(nn.Module):
-    def __init__(self,embed_dim, mlp_scale : int = 2, drop_rate: float = 0.0):
+    def __init__(self, embed_dim, mlp_scale: int = 2, drop_rate: float = 0.0):
         super().__init__()
-        self.ln1 = nn.LayerNorm(embed_dim, embed_dim*mlp_scale)
-        self.g1 = nn.GELU()
-        self.ln2 = nn.LayerNorm(embed_dim*mlp_scale, embed_dim)
-        self.drop = nn.Dropout(drop_rate)
-
-    def forward(self,x):
-        x = self.ln1(x)
-        x = self.g1(x)
-        x = self.ln2(x)
-        x = self.drop(x)
-        return x
-
-class MHSA(nn.Module):
-    def __init__(self, embed_dim, num_heads, seq_len=250, dropout=0.2,device='cuda'):
-        super().__init__()
-
-        assert embed_dim % num_heads == 0, "embed_dim is indivisible by num_heads"
-
-        self.num_heads = num_heads
-        self.seq_length = seq_len
-        self.head_dim = embed_dim // num_heads
-        self.d_k = self.head_dim ** 0.5
-        self.device = device
-        # Create the projections for Q,K,V
-        self.k_proj = nn.Linear(embed_dim, embed_dim)
-        self.q_proj = nn.Linear(embed_dim, embed_dim)
-        self.v_proj = nn.Linear(embed_dim, embed_dim)
-        self.dropout = nn.Dropout(dropout)
-
-
-    def forward(self, x,attn_mask=None,key_padding_mask=None,need_weights=False):
-        batch_size, seq_len, embed_dim = x.shape
-
-        # Project input x to queries, keys, and values
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-
-        # Shaping Q, K, and V tensors
-        k = tensor.view(batch_size, seq_len, self.num_heads, self.head_dim)
-        v = tensor.view(batch_size, seq_len, self.num_heads, self.head_dim)
-        q = tensor.view(batch_size, seq_len, self.num_heads, self.head_dim)
-
-        # Transposing for alignment, don't change
-        k = torch.transpose(k, 1, 2)
-        q = torch.transpose(q, 1, 2)
-        v = torch.transpose(v, 1, 2)
-
-        # Attention determination, don't change
-        K = torch.transpose(k, 2, 3)
-        Q = q
-        attn_scores = Q @ K^T / self.d_k
-
-        # Option for masked
-        if attn_mask is not None:
-            attn_scores.masked_fill_(attn_mask,-torch.inf)
-
-        # Option for adding padding
-        if key_padding_mask is not None:
-            key_padding_mask = key_padding_mask[:, None, None, :]
-            attn_scores.masked_fill_(key_padding_mask,-torch.inf)
-
-        # Compute the softmax over attention
-        attn_scores = F.softmax(attn_scores, dim=-1)
-
-        # Apply dropout
-        attn_scores = self.dropout(attn_scores)
-
-        # Apply V weighting
-        attn_output = attn_scores @ v
-
-        # Transpose for alignment, don't change
-        attn_output = torch.transpose(attn_output, 1, 2)
-
-        # Flatten back out to 1 dimension
-        attn_output = attn_output.contiguous().view(batch_size,seq_len,embed_dim)
-
-        if need_weights:
-            return attn_output,attn_scores
-        else:
-            return attn_output,None
-
-class EncoderBlock(nn.Module):
-    def __init__(self,embed_dim,num_heads, mlp_scale : int = 2,drop_rate: float = 0.2, device='cuda'):
-        super().__init__()
-
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.device = device
-        self.mlp_scale = mlp_scale
-        self.drop_rate = drop_rate
-        self.LN1 = nn.LayerNorm(embed_dim)
-        self.attn = MHSA(embed_dim=embed_dim, num_heads=num_heads, seq_len=250, dropout=drop_rate, device=device)
-        self.c_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-        self.LN2 = nn.LayerNorm(embed_dim)
-        # Feed forward
-        self.FF = FF(embed_dim=embed_dim, mlp_scale=mlp_scale, drop_rate=drop_rate)
-
-    # Mask generation, unused
-    def generate_mask(self,seq_len):
-        return torch.triu(torch.ones((seq_len, seq_len), device=self.device, dtype=torch.bool), diagonal=1)
-
-    def forward(self, x,padding_mask=None,need_weights=False):
-        B,N_t,t_dim = x.shape
-        x_norm = self.Ln1(x)
-        
-        # Calculate attention and weights
-        attn,attn_weights = self.attn(x_norm, key_padding_mask=None, need_weights=False)
-
-        attn = self.c_proj(attn) # Optional projection layer - done for you
-
-        # Add attention
-        x = x + attn
-        # Calculate residual to add
-        res = self.FF(self.LN2(x))
-        # Add residual
-        x = x + res
-        return x
-
-### Vision model class, MUST be converted back to regular transformer using nn.Transformer
-
-class ViT(nn.Module):
-    def __init__(self, image_size, patch_size, embed_dim, num_classes=10,
-                 attn_heads=[2, 4, 2], mlp_scale: int = 2, drop_rates=[0.0, 0.0, 0.0], device='cuda'):
-        super().__init__()
-
-        # Ensure drop_rates and attn_heads lists are consistent
-        assert len(drop_rates) == len(attn_heads), "drop_rates and attn_heads must be of same length"
-        # Ensure the image dimensions are divisible by the patch size
-        assert image_size[1] % patch_size == 0 and image_size[2] % patch_size == 0, \
-            'image dimensions must be divisible by the patch size'
-
-        channels = image_size[0]
-        # Compute the number of patches by dividing the height and width by patch size
-        num_patches = (image_size[1] // patch_size) * (image_size[2] // patch_size)
-        # Each patch is flattened into a vector of size (channels * patch_size^2)
-        patch_dim = channels * patch_size ** 2
-        self.device = device
-
-        # Patch embedding layer:
-        # 1. Rearranges the image into a sequence of flattened patches
-        # 2. Applies LayerNorm to each patch
-        # 3. Projects to the embedding dimension using a Linear layer
-        # 4. Applies another LayerNorm
-        self.patch_embedding = nn.Sequential(
-            Rearrange("b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1=patch_size, p2=patch_size),
-            nn.LayerNorm(patch_dim),
-            nn.Linear(patch_dim, embed_dim),
-            nn.LayerNorm(embed_dim),
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * mlp_scale),
+            nn.GELU(),
+            nn.Linear(embed_dim * mlp_scale, embed_dim),
+            nn.Dropout(drop_rate),
         )
 
-        # Positional embedding to retain spatial information (learned parameter)
-        # Shape: (1, num_patches + 1, embed_dim); +1 for the [CLS] token
-        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, embed_dim))
+    def forward(self, x):
+        return self.net(x)
 
-        # Create a list of transformer encoder blocks, each with a different number of attention heads
-        # and optional dropout
-        layers_ = [
-            EncoderBlock(embed_dim, attn_heads[i], mlp_scale, drop_rate=drop_rates[i])
+# ─── MHSA ────────────────────────────────────────────────────────────────────
+
+class MHSA(nn.Module):
+    def __init__(self, embed_dim, num_heads, dropout=0.0, device='cuda'):
+        super().__init__()
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+
+        self.num_heads = num_heads
+        self.head_dim  = embed_dim // num_heads
+        self.scale     = self.head_dim ** 0.5
+
+        self.k_proj  = nn.Linear(embed_dim, embed_dim)
+        self.q_proj  = nn.Linear(embed_dim, embed_dim)
+        self.v_proj  = nn.Linear(embed_dim, embed_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, key_padding_mask=None, need_weights=False):
+        B, T, C = x.shape
+
+        q = self.q_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+
+        attn = (q @ k.transpose(-2, -1)) / self.scale          # (B, H, T, T)
+
+        if key_padding_mask is not None:
+            # key_padding_mask: (B, T), True = IGNORE
+            attn = attn.masked_fill(key_padding_mask[:, None, None, :], -1e9)
+            # Use -1e9 instead of -inf to avoid NaN when entire rows are masked
+
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+
+        out = (attn @ v).transpose(1, 2).contiguous().view(B, T, C)
+        return out, (attn if need_weights else None)
+
+# ─── EncoderBlock ─────────────────────────────────────────────────────────────
+
+class EncoderBlock(nn.Module):
+    def __init__(self, embed_dim, num_heads, mlp_scale: int = 2,
+                 drop_rate: float = 0.0, device='cuda'):
+        super().__init__()
+        self.LN1    = nn.LayerNorm(embed_dim)
+        self.attn   = MHSA(embed_dim, num_heads, dropout=drop_rate, device=device)
+        self.c_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.LN2    = nn.LayerNorm(embed_dim)
+        self.ff     = FF(embed_dim, mlp_scale=mlp_scale, drop_rate=drop_rate)
+
+    def forward(self, x, padding_mask=None, need_weights=False):
+        attn_out, attn_weights = self.attn(
+            self.LN1(x), key_padding_mask=padding_mask, need_weights=need_weights
+        )
+        x = x + self.c_proj(attn_out)
+        x = x + self.ff(self.LN2(x))
+        return x
+
+# ─── Classifier ──────────────────────────────────────────────────────────────
+
+class Classifier(nn.Module):
+    def __init__(self, num_features, embed_dim, num_classes=1,
+                 attn_heads=[4, 8, 8], mlp_scale: int = 2,
+                 drop_rates=[0.0, 0.0, 0.0], device='cuda', max_seq_len=182):
+        super().__init__()
+        assert len(drop_rates) == len(attn_heads)
+
+        self.embedding     = nn.Linear(num_features, embed_dim)
+        self.cls_token     = nn.Parameter(torch.randn(1, 1, embed_dim))
+        self.pos_embedding = nn.Parameter(torch.randn(1, max_seq_len + 1, embed_dim))
+
+        self.layers = nn.ModuleList([
+            EncoderBlock(embed_dim, attn_heads[i], mlp_scale,
+                         drop_rate=drop_rates[i], device=device)
             for i in range(len(attn_heads))
-        ]
-        self.layers = nn.ModuleList(layers_)
+        ])
 
-        # Classification head to project the [CLS] token's embedding to logits for each class
         self.mlp_head = nn.Linear(embed_dim, num_classes)
 
-        # Learnable [CLS] token used for classification
-        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
-
     def forward(self, x, padding_mask=None):
-        batch_size = x.size(0)
+        B = x.size(0)
 
-        # Convert image into a sequence of embedded patches
-        x = self.patch_embedding(x)  # Shape: (B, num_patches, embed_dim)
+        x = self.embedding(x)                                       # (B, T, D)
+        x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)  # (B, T+1, D)
+        x = x + self.pos_embedding[:, :x.size(1)]
 
-        # Expand the [CLS] token to match the batch size
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # Shape: (B, 1, embed_dim)
+        if padding_mask is not None:
+            cls_mask     = torch.zeros(B, 1, dtype=torch.bool, device=x.device)
+            padding_mask = torch.cat([cls_mask, padding_mask], dim=1)
 
-        # Prepend the [CLS] token to the patch embeddings
-        x = torch.cat((cls_tokens, x), dim=1)  # Shape: (B, num_patches + 1, embed_dim)
-
-        # Add positional embeddings
-        x = x + self.pos_embedding[:, :x.size(1)]  # Shape: (B, num_patches + 1, embed_dim)
-
-        # Pass through the stack of transformer encoder blocks
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, padding_mask=padding_mask)
 
-        # Use the [CLS] token's output for classification
-        return self.mlp_head(x[:, 0])  # Shape: (B, num_classes)
+        return self.mlp_head(x[:, 0]).squeeze(-1)                   # (B,)
 
+# ─── Model Init ──────────────────────────────────────────────────────────────
 
-### Training script
+embed_dim   = 256
+mlp_scale   = 2
+drop_rates  = [0.1, 0.1, 0.1]
+attn_heads  = [4, 8, 8]
+num_classes = 1
 
-image_size = train_dataset.__getitem__(0)[0].shape
-patch_size = 4 # Patch size - grab patch x patch pixels to form an element in the sequence
-embed_dim = 64 # embedding dimension - each patch is projected in a space of dim = embed_dim
-mlp_scale = 2 # instead of specifying the MLP dimensions explicitly, scale it based off of embed_dim
-drop_rates = [0.0,0.0,0.0] # applied for each encoderblock
-attn_heads = [2,2,2] # 3 encoder blocks, each with 2 heads -> embed_dim // attn_heads[i] should = 0
-num_classes = len(mnist_classes)
-model = ViT(image_size,patch_size,embed_dim,num_classes=num_classes,attn_heads=attn_heads,mlp_scale=mlp_scale,drop_rates=drop_rates,device=device)
-t_params = sum(p.numel() for p in model.parameters())
-print("Network Parameters: ",t_params)
+model = Classifier(
+    num_features=num_features,
+    embed_dim=embed_dim,
+    num_classes=num_classes,
+    attn_heads=attn_heads,
+    mlp_scale=mlp_scale,
+    drop_rates=drop_rates,
+    device=device,
+    max_seq_len=max_seq_len,
+)
 model.to(device)
+print(f"Network Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-def train(model, num_epochs, train_dl, valid_dl,lr=0.001,device='cuda',seed=8):
+# ─── Training ────────────────────────────────────────────────────────────────
+
+def train(model, num_epochs, train_dl, valid_dl, lr=1e-4, device='cuda', seed=8):
     model.to(device)
     torch.manual_seed(seed)
     np.random.seed(seed)
     torch.cuda.manual_seed(seed)
 
-    loss_fn = nn.CrossEntropyLoss()
+    # Class-weighted loss for imbalanced disruption data
+    all_labels  = torch.tensor([y for _, _, y in train_dl.dataset])
+    pos         = all_labels.sum().item()
+    neg         = len(all_labels) - pos
+    pos_weight  = torch.tensor([neg / pos], device=device)
+    print(f"Class balance — pos: {int(pos)}, neg: {int(neg)}, pos_weight: {pos_weight.item():.2f}")
+
+    loss_fn   = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    loss_hist_train = [0] * num_epochs
-    accuracy_hist_train = [0] * num_epochs
-    loss_hist_valid = [0] * num_epochs
-    accuracy_hist_valid = [0] * num_epochs
+    loss_hist_train,     loss_hist_valid     = [0] * num_epochs, [0] * num_epochs
+    accuracy_hist_train, accuracy_hist_valid = [0] * num_epochs, [0] * num_epochs
+    f1_hist_train,       f1_hist_valid       = [0] * num_epochs, [0] * num_epochs
 
     for epoch in range(num_epochs):
         model.train()
-        kbar = pkbar.Kbar(target=len(train_dl), epoch=epoch, num_epochs=num_epochs, width=20, always_stateful=False)
+        kbar = pkbar.Kbar(target=len(train_dl), epoch=epoch, num_epochs=num_epochs,
+                          width=20, always_stateful=False)
 
-        total_correct = 0
-        total_loss = 0
+        total_loss    = 0
+        all_preds_tr  = []
+        all_labels_tr = []
 
-        for i, (x_batch, y_batch) in enumerate(train_dl):
-            x_batch = x_batch.to(device)
-            y_batch = y_batch.to(device)
+        for i, (x_batch, pad_mask, y_batch) in enumerate(train_dl):
+            x_batch  = x_batch.to(device)
+            y_batch  = y_batch.to(device)
+            # Flip: dataset True=real → model expects True=IGNORE
+            padding_mask = (~pad_mask).to(device)
 
-            pred = model(x_batch)
+            pred = model(x_batch, padding_mask=padding_mask)
             loss = loss_fn(pred, y_batch)
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
 
-            batch_correct = (torch.argmax(pred, dim=1) == y_batch).float().sum()
-            total_correct += batch_correct.item()
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            preds_bin  = (pred > 0).float()
+            batch_acc  = (preds_bin == y_batch).float().mean().item()
             total_loss += loss.item() * y_batch.size(0)
 
-            kbar.update(i, values=[("loss", loss.item()), ("acc", batch_correct.item() / y_batch.size(0))])
+            all_preds_tr.extend(preds_bin.cpu().tolist())
+            all_labels_tr.extend(y_batch.cpu().tolist())
 
-        loss_hist_train[epoch] = total_loss / len(train_dl.dataset)
-        accuracy_hist_train[epoch] = total_correct / len(train_dl.dataset)
+            kbar.update(i, values=[("loss", loss.item()), ("acc", batch_acc)])
 
+        loss_hist_train[epoch]     = total_loss / len(train_dl.dataset)
+        accuracy_hist_train[epoch] = (np.array(all_preds_tr) == np.array(all_labels_tr)).mean()
+        f1_hist_train[epoch]       = f1_score(all_labels_tr, all_preds_tr, zero_division=0)
+
+        # ── Validation ───────────────────────────────────────────────────────
         model.eval()
-        val_loss = 0
-        val_correct = 0
+        val_loss       = 0
+        all_preds_val  = []
+        all_labels_val = []
+
         with torch.no_grad():
-            for x_batch, y_batch in valid_dl:
-                x_batch = x_batch.to(device)
-                y_batch = y_batch.to(device)
-                pred = model(x_batch)
-                loss = loss_fn(pred, y_batch)
-                val_loss += loss.item() * y_batch.size(0)
-                val_correct += (torch.argmax(pred, dim=1) == y_batch).float().sum().item()
+            for x_batch, pad_mask, y_batch in valid_dl:
+                x_batch      = x_batch.to(device)
+                y_batch      = y_batch.to(device)
+                padding_mask = (~pad_mask).to(device)
 
-        loss_hist_valid[epoch] = val_loss / len(valid_dl.dataset)
-        accuracy_hist_valid[epoch] = val_correct / len(valid_dl.dataset)
+                pred     = model(x_batch, padding_mask=padding_mask)
+                val_loss += loss_fn(pred, y_batch).item() * y_batch.size(0)
 
-        kbar.add(1, values=[("val_loss", loss_hist_valid[epoch]), ("val_acc", accuracy_hist_valid[epoch])])
+                preds_bin = (pred > 0).float()
+                all_preds_val.extend(preds_bin.cpu().tolist())
+                all_labels_val.extend(y_batch.cpu().tolist())
 
-    return loss_hist_train, loss_hist_valid, accuracy_hist_train, accuracy_hist_valid
+        loss_hist_valid[epoch]     = val_loss / len(valid_dl.dataset)
+        accuracy_hist_valid[epoch] = (np.array(all_preds_val) == np.array(all_labels_val)).mean()
+        f1_hist_valid[epoch]       = f1_score(all_labels_val, all_preds_val, zero_division=0)
 
-### Training function call
+        print(
+            f"Epoch {epoch+1:02d} | "
+            f"Train  Loss: {loss_hist_train[epoch]:.4f}  Acc: {accuracy_hist_train[epoch]:.4f}  F1: {f1_hist_train[epoch]:.4f} | "
+            f"Val    Loss: {loss_hist_valid[epoch]:.4f}  Acc: {accuracy_hist_valid[epoch]:.4f}  F1: {f1_hist_valid[epoch]:.4f}"
+        )
+
+    return loss_hist_train, loss_hist_valid, accuracy_hist_train, accuracy_hist_valid, f1_hist_train, f1_hist_valid
+
+# ─── Run ─────────────────────────────────────────────────────────────────────
 
 num_epochs = 10
 hist = train(model, num_epochs, train_dl, valid_dl)
 
-### Training loss
+# ─── Evaluation: Graphs, Metrics, Prediction Testing ────────────────────────
+# Run this cell AFTER training completes and hist is returned
 
-def plot_loss(hist):
-    x_arr = np.arange(len(hist[0])) + 1  # number of epochs
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from sklearn.metrics import (
+    classification_report, confusion_matrix, roc_curve,
+    auc, precision_recall_curve, average_precision_score
+)
+import warnings
+warnings.filterwarnings('ignore')
 
-    fig = plt.figure(figsize=(12, 4))
+# Unpack history
+loss_tr, loss_val, acc_tr, acc_val, f1_tr, f1_val = hist
+epochs = range(1, len(loss_tr) + 1)
 
-    ax = fig.add_subplot(1, 2, 1)
-    ax.plot(x_arr, hist[0], '-o', label='Train loss')
-    ax.plot(x_arr, hist[1], '--<', label='Validation loss')
-    ax.set_xlabel('Epoch', size=15)
-    ax.set_ylabel('Loss', size=15)
-    ax.legend(fontsize=15)
+# ─── 1. Training Curves ───────────────────────────────────────────────────────
 
-    ax = fig.add_subplot(1, 2, 2)
-    ax.plot(x_arr, hist[2], '-o', label='Train acc.')
-    ax.plot(x_arr, hist[3], '--<', label='Validation acc.')
-    ax.legend(fontsize=15)
-    ax.set_xlabel('Epoch', size=15)
-    ax.set_ylabel('Accuracy', size=15)
-    plt.show()
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+fig.suptitle("Training History — CMod Disruption Classifier", fontsize=13, fontweight='bold')
 
-plot_loss(hist)
+axes[0].plot(epochs, loss_tr,  'o-', label='Train', color='#2563eb')
+axes[0].plot(epochs, loss_val, 'o-', label='Val',   color='#f97316', linestyle='--')
+axes[0].set_title('Loss');  axes[0].set_xlabel('Epoch'); axes[0].legend(); axes[0].grid(alpha=0.3)
 
+axes[1].plot(epochs, acc_tr,  'o-', label='Train', color='#2563eb')
+axes[1].plot(epochs, acc_val, 'o-', label='Val',   color='#f97316', linestyle='--')
+axes[1].set_title('Accuracy'); axes[1].set_xlabel('Epoch'); axes[1].legend(); axes[1].grid(alpha=0.3)
 
+axes[2].plot(epochs, f1_tr,  'o-', label='Train', color='#2563eb')
+axes[2].plot(epochs, f1_val, 'o-', label='Val',   color='#f97316', linestyle='--')
+axes[2].set_title('F1 Score'); axes[2].set_xlabel('Epoch'); axes[2].legend(); axes[2].grid(alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('training_curves.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+# ─── 2. Collect Val Predictions (raw logits + labels) ────────────────────────
+
+model.eval()
+all_logits = []
+all_labels = []
+all_probs  = []
+
+with torch.no_grad():
+    for x_batch, pad_mask, y_batch in valid_dl:
+        x_batch      = x_batch.to(device)
+        padding_mask = (~pad_mask).to(device)
+
+        logits = model(x_batch, padding_mask=padding_mask)
+        probs  = torch.sigmoid(logits)
+
+        all_logits.extend(logits.cpu().tolist())
+        all_probs.extend(probs.cpu().tolist())
+        all_labels.extend(y_batch.tolist())
+
+all_logits = np.array(all_logits)
+all_probs  = np.array(all_probs)
+all_labels = np.array(all_labels)
+all_preds  = (all_logits > 0).astype(int)
+
+# ─── 3. Classification Report ─────────────────────────────────────────────────
+
+print("=" * 55)
+print("       CLASSIFICATION REPORT — Validation Set")
+print("=" * 55)
+print(classification_report(all_labels, all_preds,
+      target_names=['Stable', 'Disruptive'], digits=4))
+
+# ─── 4. Confusion Matrix ──────────────────────────────────────────────────────
+
+cm = confusion_matrix(all_labels, all_preds)
+tn, fp, fn, tp = cm.ravel()
+
+fig, ax = plt.subplots(figsize=(5, 4))
+im = ax.imshow(cm, cmap='Blues')
+ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
+ax.set_xticklabels(['Stable', 'Disruptive']); ax.set_yticklabels(['Stable', 'Disruptive'])
+ax.set_xlabel('Predicted'); ax.set_ylabel('Actual')
+ax.set_title('Confusion Matrix — Validation Set', fontweight='bold')
+for i in range(2):
+    for j in range(2):
+        ax.text(j, i, cm[i, j], ha='center', va='center',
+                color='white' if cm[i, j] > cm.max() / 2 else 'black', fontsize=14)
+plt.colorbar(im, ax=ax)
+plt.tight_layout()
+plt.savefig('confusion_matrix.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+print(f"\nTP: {tp}  FP: {fp}  TN: {tn}  FN: {fn}")
+print(f"Missed disruptions (FN): {fn}  |  False alarms (FP): {fp}")
+
+# ─── 5. ROC + PR Curves ───────────────────────────────────────────────────────
+
+fpr, tpr, roc_thresh = roc_curve(all_labels, all_probs)
+roc_auc              = auc(fpr, tpr)
+
+prec, rec, pr_thresh = precision_recall_curve(all_labels, all_probs)
+ap                   = average_precision_score(all_labels, all_probs)
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
+
+ax1.plot(fpr, tpr, color='#2563eb', lw=2, label=f'AUC = {roc_auc:.4f}')
+ax1.plot([0, 1], [0, 1], 'k--', lw=1)
+ax1.set_xlabel('False Positive Rate'); ax1.set_ylabel('True Positive Rate')
+ax1.set_title('ROC Curve', fontweight='bold'); ax1.legend(); ax1.grid(alpha=0.3)
+
+ax2.plot(rec, prec, color='#f97316', lw=2, label=f'AP = {ap:.4f}')
+ax2.axhline(y=all_labels.mean(), color='k', linestyle='--', lw=1, label='Baseline (prevalence)')
+ax2.set_xlabel('Recall'); ax2.set_ylabel('Precision')
+ax2.set_title('Precision-Recall Curve', fontweight='bold'); ax2.legend(); ax2.grid(alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('roc_pr_curves.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+print(f"\nROC-AUC: {roc_auc:.4f}  |  Average Precision: {ap:.4f}")
+
+# ─── 6. Threshold Sweep — find best F1 threshold ─────────────────────────────
+
+from sklearn.metrics import f1_score as f1s
+
+thresholds  = np.linspace(0.01, 0.99, 200)
+f1_scores   = [f1s(all_labels, (all_probs > t).astype(int), zero_division=0) for t in thresholds]
+best_thresh = thresholds[np.argmax(f1_scores)]
+best_f1     = max(f1_scores)
+
+plt.figure(figsize=(7, 3))
+plt.plot(thresholds, f1_scores, color='#2563eb', lw=2)
+plt.axvline(best_thresh, color='#f97316', linestyle='--', label=f'Best threshold = {best_thresh:.2f}')
+plt.xlabel('Decision Threshold'); plt.ylabel('F1 Score')
+plt.title('F1 vs Decision Threshold', fontweight='bold')
+plt.legend(); plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig('threshold_sweep.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+print(f"\nDefault threshold (0.5) F1:  {f1s(all_labels, (all_probs > 0.5).astype(int)):.4f}")
+print(f"Best threshold ({best_thresh:.2f})  F1:  {best_f1:.4f}")
+
+# ─── 7. Per-Shot Prediction Testing ──────────────────────────────────────────
+# Grab a few individual shots from the validation set and show predictions
+
+print("\n" + "=" * 55)
+print("         PER-SHOT PREDICTION TESTING")
+print("=" * 55)
+
+model.eval()
+results = []
+
+with torch.no_grad():
+    for idx in range(len(val_dataset)):
+        seq, mask, label = val_dataset[idx]
+        x    = seq.unsqueeze(0).to(device)
+        pm   = (~mask.unsqueeze(0)).to(device)
+        logit = model(x, padding_mask=pm).item()
+        prob  = torch.sigmoid(torch.tensor(logit)).item()
+        pred  = int(logit > 0)
+        results.append({
+            'idx':    idx,
+            'label':  int(label.item()),
+            'pred':   pred,
+            'prob':   prob,
+            'correct': pred == int(label.item()),
+        })
+
+# Show sample of each category
+import random
+random.seed(42)
+
+def show_samples(title, items, n=5):
+    sample = random.sample(items, min(n, len(items)))
+    print(f"\n── {title} (showing {len(sample)}) ──")
+    print(f"  {'Shot idx':>8}  {'True':>6}  {'Pred':>6}  {'P(disrupt)':>11}  {'✓/✗':>4}")
+    for r in sample:
+        mark = '✓' if r['correct'] else '✗'
+        true_lbl = 'DISRUPT' if r['label'] else 'stable'
+        pred_lbl = 'DISRUPT' if r['pred']  else 'stable'
+        print(f"  {r['idx']:>8}  {true_lbl:>7}  {pred_lbl:>7}  {r['prob']:>10.3f}  {mark:>4}")
+
+tp_list = [r for r in results if r['label']==1 and r['pred']==1]
+tn_list = [r for r in results if r['label']==0 and r['pred']==0]
+fp_list = [r for r in results if r['label']==0 and r['pred']==1]
+fn_list = [r for r in results if r['label']==1 and r['pred']==0]
+
+show_samples("True Positives  (caught disruptions)",   tp_list)
+show_samples("True Negatives  (correctly stable)",     tn_list)
+show_samples("False Positives (false alarms)",         fp_list)
+show_samples("False Negatives (missed disruptions)",   fn_list)
+
+print(f"\nSummary: {len(tp_list)} TP | {len(fp_list)} FP | {len(tn_list)} TN | {len(fn_list)} FN")
+print(f"Missed disruptions: {len(fn_list)} / {len(tp_list)+len(fn_list)} total disruptive shots")
